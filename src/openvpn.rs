@@ -244,6 +244,8 @@ impl OpenVPN3Manager {
         }
         if let Err(e) = self.handle_list_sessions().await {
             self.send_error(format!("Failed to load initial sessions: {}", e));
+        } else {
+            connection_monitoring_active = self.restore_active_session();
         }
         if let Err(e) = self.handle_get_vpn_cli_version().await {
             self.send_error(format!("Failed to get OpenVPN3 CLI version: {}", e));
@@ -269,7 +271,8 @@ impl OpenVPN3Manager {
                         if let Err(e) = self.handle_disconnect().await {
                             self.send_error(format!("Disconnect failed: {}", e));
                         }
-                        connection_monitoring_active = false;
+                        connection_monitoring_active =
+                            !matches!(self.get_status(), ConnectionStatus::Disconnected);
                     }
                     VpnCommand::GetStatusUpdate => {
                         if let Err(e) = self.update_connection_status().await {
@@ -494,28 +497,44 @@ impl OpenVPN3Manager {
     }
 
     async fn handle_disconnect(&self) -> Result<()> {
+        self.disconnect_with_command(TokioCommand::new("openvpn3"))
+            .await
+    }
+
+    async fn disconnect_with_command(&self, mut command: TokioCommand) -> Result<()> {
         let session_path_opt = self.current_session_path.lock().unwrap().clone();
 
         if let Some(session_path) = session_path_opt {
+            let previous_status = self.get_status();
             self.set_status(ConnectionStatus::Disconnecting);
             self.log_manager_message(format!("Disconnecting session: {}", session_path));
 
-            let output = TokioCommand::new("openvpn3")
-                .args([
-                    "session-manage",
-                    "--session-path",
-                    &session_path,
-                    "--disconnect",
-                ])
-                .output()
-                .await?;
+            let result = async {
+                let output = command
+                    .args([
+                        "session-manage",
+                        "--session-path",
+                        &session_path,
+                        "--disconnect",
+                    ])
+                    .output()
+                    .await?;
 
-            if !output.status.success() {
-                let error = String::from_utf8_lossy(&output.stderr).to_string();
-                self.log_manager_message(format!("Disconnect command failed: {}", error));
-            } else {
-                self.log_manager_message("Disconnect command successful.".to_string());
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "Disconnect command failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Ok(())
             }
+            .await;
+
+            if let Err(error) = result {
+                self.set_status(previous_status);
+                return Err(error);
+            }
+            self.log_manager_message("Disconnect command successful.".to_string());
         } else {
             self.log_manager_message(
                 "Disconnect called but no active session path found.".to_string(),
@@ -526,6 +545,27 @@ impl OpenVPN3Manager {
         *self.stats.lock().unwrap() = None;
         self.set_status(ConnectionStatus::Disconnected);
         Ok(())
+    }
+
+    fn restore_active_session(&self) -> bool {
+        let session = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|session| session.status.contains("Connection, Client connected"))
+            .cloned();
+
+        if let Some(session) = session {
+            *self.current_session_path.lock().unwrap() = Some(session.session_path);
+            self.set_status(ConnectionStatus::Connected {
+                ip: "Assigned".to_string(),
+                duration: session.created,
+            });
+            true
+        } else {
+            false
+        }
     }
 
     async fn update_connection_status(&self) -> Result<()> {
@@ -1068,6 +1108,114 @@ impl OpenVPN3Manager {
                 },
             ) => o_p != n_p || o_pr != n_pr,
             _ => std::mem::discriminant(old) != std::mem::discriminant(new),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopening_restores_first_connected_session_without_disconnect() {
+        let (message_tx, message_rx) = mpsc::channel();
+        let (manager, command_rx) = OpenVPN3Manager::new(message_tx);
+        assert!(!manager.restore_active_session());
+        assert_eq!(manager.get_status(), ConnectionStatus::Disconnected);
+
+        *manager.sessions.lock().unwrap() = manager.parse_sessions_list(
+            "Path: /test/pending\nStatus: Connection, Connecting\n\
+             Path: /test/connected\nCreated: today\nStatus: Connection, Client connected\n\
+             Path: /test/another\nStatus: Connection, Client connected\n",
+        );
+        assert!(manager.restore_active_session());
+        assert_eq!(
+            manager.current_session_path.lock().unwrap().as_deref(),
+            Some("/test/connected")
+        );
+        assert_eq!(
+            manager.get_status(),
+            ConnectionStatus::Connected {
+                ip: "Assigned".into(),
+                duration: "today".into(),
+            }
+        );
+        assert!(message_rx.try_iter().any(|message| matches!(
+            message,
+            VpnMessage::StatusUpdate(ConnectionStatus::Connected { .. })
+        )));
+        manager.shutdown().unwrap();
+        assert!(matches!(command_rx.try_recv(), Ok(VpnCommand::Shutdown)));
+        assert!(command_rx.try_recv().is_err());
+        assert!(matches!(
+            manager.get_status(),
+            ConnectionStatus::Connected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn disconnect_preserves_session_on_failure_and_clears_it_on_success() {
+        for scenario in ["failure", "spawn-error", "success"] {
+            let (message_tx, message_rx) = mpsc::channel();
+            let (manager, _command_rx) = OpenVPN3Manager::new(message_tx);
+            let connected = ConnectionStatus::Connected {
+                ip: "10.0.0.2".into(),
+                duration: "1 minute".into(),
+            };
+            *manager.status.lock().unwrap() = connected.clone();
+            *manager.current_session_path.lock().unwrap() = Some("/test/session".into());
+            *manager.stats.lock().unwrap() = Some(SessionStats {
+                bytes_in: 123,
+                bytes_out: 456,
+                packets_in: 1,
+                packets_out: 2,
+                connected_since: "now".into(),
+                virtual_ip: "10.0.0.2".into(),
+                remote_ip: "192.0.2.1".into(),
+            });
+
+            let mut command = TokioCommand::new("/bin/sh");
+            match scenario {
+                "failure" => {
+                    command.args(["-c", "printf 'disconnect refused' >&2; exit 1"]);
+                }
+                "spawn-error" => {
+                    command = TokioCommand::new("/dev/null/openvpn3");
+                }
+                _ => {
+                    command.args([
+                        "-c",
+                        "test \"$1\" = session-manage && test \"$2\" = --session-path && test \"$3\" = /test/session && test \"$4\" = --disconnect",
+                        "disconnect-test",
+                    ]);
+                }
+            }
+
+            let result = manager.disconnect_with_command(command).await;
+            if scenario == "success" {
+                assert!(result.is_ok());
+                assert_eq!(manager.get_status(), ConnectionStatus::Disconnected);
+                assert!(manager.current_session_path.lock().unwrap().is_none());
+                assert!(manager.stats.lock().unwrap().is_none());
+            } else {
+                let error = result.unwrap_err().to_string();
+                if scenario == "failure" {
+                    assert!(error.contains("disconnect refused"));
+                }
+                assert_eq!(manager.get_status(), connected);
+                assert_eq!(
+                    manager.current_session_path.lock().unwrap().as_deref(),
+                    Some("/test/session")
+                );
+                assert_eq!(
+                    manager.stats.lock().unwrap().as_ref().unwrap().bytes_in,
+                    123
+                );
+                assert!(!message_rx.try_iter().any(|message| matches!(
+                    message,
+                    VpnMessage::StatusUpdate(ConnectionStatus::Disconnected)
+                )));
+            }
         }
     }
 }

@@ -103,6 +103,8 @@ See [Building from Source](#building-from-source) section below.
 - **Remove**: Delete configurations you no longer need
 
 #### Monitoring Connections
+Closing the GUI leaves VPN sessions running. On reopening, the **Connection** tab restores the first connected session returned by OpenVPN3 and resumes monitoring it. If multiple sessions are connected, the **Sessions** tab lists them all; **Disconnect** affects only the tracked session.
+
 - **Sessions Tab**: View all active OpenVPN3 sessions
 - **Statistics Tab**: Real-time connection statistics
 - **Logs Tab**: Live logging and error tracking
@@ -263,6 +265,9 @@ export GDK_BACKEND=x11
 1. Verify credentials work with OpenVPN3 CLI: `openvpn3 session-start --config your-config`
 2. Check if configuration requires certificates or special authentication
 3. Review logs in the Logs tab for detailed error messages
+
+#### Disconnect fails
+If OpenVPN3 rejects a disconnect request, the GUI reports the error and retains the tracked session and statistics. Monitoring continues so the connection is not incorrectly shown as disconnected. Resolve the reported error, then retry **Disconnect**.
 
 #### Configuration import fails
 **Solution**:
